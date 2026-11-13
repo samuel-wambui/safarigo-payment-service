@@ -1,6 +1,8 @@
 package Ngaritech.com.payment_service.payment;
 
 import java.time.Instant;
+import java.time.LocalDate;
+import java.math.BigDecimal;
 import java.util.UUID;
 
 public record PaymentResponse(
@@ -10,6 +12,11 @@ public record PaymentResponse(
         String conversationId,
         long amountMinor,
         String currency,
+        long sourceAmountMinor,
+        String sourceCurrency,
+        BigDecimal fxRate,
+        LocalDate fxRateDate,
+        String fxProvider,
         String provider,
         String providerReference,
         String idempotencyKey,
@@ -29,6 +36,11 @@ public record PaymentResponse(
                 payment.getConversationId(),
                 payment.getAmountMinor(),
                 payment.getCurrency(),
+                payment.getSourceAmountMinor(),
+                payment.getSourceCurrency(),
+                payment.getFxRate(),
+                payment.getFxRateDate(),
+                payment.getFxProvider(),
                 payment.getProvider(),
                 payment.getProviderReference(),
                 payment.getIdempotencyKey(),

@@ -1,12 +1,15 @@
 package Ngaritech.com.payment_service.payment;
 
 import Ngaritech.com.payment_service.common.ResourceNotFoundException;
+import Ngaritech.com.payment_service.fx.FxRateClient;
+import Ngaritech.com.payment_service.fx.FxRateQuote;
 import Ngaritech.com.payment_service.MpesaIntergration.Mpesa_Express.InternalStkPushRequest;
 import Ngaritech.com.payment_service.MpesaIntergration.Mpesa_Express.StkPushSyncResponse;
 import Ngaritech.com.payment_service.MpesaIntergration.Services.DarajaApi;
 import Ngaritech.com.payment_service.outbox.PaymentOutboxEvent;
 import Ngaritech.com.payment_service.outbox.PaymentOutboxEventRepository;
 import Ngaritech.com.payment_service.payment.dto.CreatePaymentRequest;
+import Ngaritech.com.payment_service.payment.dto.FxQuoteRequest;
 import Ngaritech.com.payment_service.payment.dto.CreateMpesaStkPaymentRequest;
 import Ngaritech.com.payment_service.payment.dto.MpesaStkPaymentResponse;
 import Ngaritech.com.payment_service.paystack.PaystackClient;
@@ -27,6 +30,10 @@ import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
@@ -47,6 +54,7 @@ public class PaymentService {
     private final ProviderTransactionRepository providerTransactionRepository;
     private final PaystackClient paystackClient;
     private final FlightAgentHandoffClient flightAgentHandoffClient;
+    private final FxRateClient fxRateClient;
     private final PaymentNotificationUrlPolicy notificationUrlPolicy;
     private final DarajaApi darajaApi;
     private final ObjectMapper objectMapper;
@@ -84,7 +92,7 @@ public class PaymentService {
         if (!"INSTANT".equals(handoff.orderType())) {
             throw new IllegalArgumentException("Paystack payment is only valid for an INSTANT booking handoff");
         }
-        String currency = handoff.currency().trim().toUpperCase(Locale.ROOT);
+        ChargeAmount charge = resolveChargeAmount(handoff, request.fxQuote());
         String reference = "pay_" + UUID.randomUUID().toString().replace("-", "");
 
         Payment payment = new Payment();
@@ -92,8 +100,13 @@ public class PaymentService {
         payment.setBookingId(request.bookingId());
         payment.setConversationId(request.conversationId());
         payment.setPaystackCustomerEmail(verifiedEmail);
-        payment.setAmountMinor(handoff.amountMinor());
-        payment.setCurrency(currency);
+        payment.setAmountMinor(charge.amountMinor());
+        payment.setCurrency(charge.currency());
+        payment.setSourceAmountMinor(charge.sourceAmountMinor());
+        payment.setSourceCurrency(charge.sourceCurrency());
+        payment.setFxRate(charge.fxRate());
+        payment.setFxRateDate(charge.fxRateDate());
+        payment.setFxProvider(charge.fxProvider());
         payment.setProvider(PAYSTACK);
         payment.setProviderReference(reference);
         payment.setIdempotencyKey(normalizedIdempotencyKey);
@@ -102,18 +115,28 @@ public class PaymentService {
         payment.setCreatedByActor(firstNonBlank(user.actor(), user.username()));
         Payment saved = paymentRepository.saveAndFlush(payment);
 
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("payment_reference", reference);
+        metadata.put("booking_id", request.bookingId().toString());
+        metadata.put("iam_user_id", user.userId().toString());
+        metadata.put("conversation_id", request.conversationId());
+        metadata.put("source_amount_minor", charge.sourceAmountMinor());
+        metadata.put("source_currency", charge.sourceCurrency());
+        metadata.put("charged_amount_minor", charge.amountMinor());
+        metadata.put("charged_currency", charge.currency());
+        if (charge.fxRate() != null) {
+            metadata.put("fx_provider", charge.fxProvider());
+            metadata.put("fx_rate", charge.fxRate().toPlainString());
+            metadata.put("fx_rate_date", charge.fxRateDate().toString());
+        }
+
         PaystackInitialization initialization = paystackClient.initialize(new PaystackInitializeRequest(
                 verifiedEmail,
-                Long.toString(handoff.amountMinor()),
-                currency,
+                Long.toString(charge.amountMinor()),
+                charge.currency(),
                 reference,
                 paystackCallbackUrl,
-                Map.of(
-                        "payment_reference", reference,
-                        "booking_id", request.bookingId().toString(),
-                        "iam_user_id", user.userId().toString(),
-                        "conversation_id", request.conversationId()
-                )
+                metadata
         ));
         if (!reference.equals(initialization.reference())) {
             throw new IllegalStateException("Paystack returned a different transaction reference");
@@ -189,6 +212,8 @@ public class PaymentService {
                 : firstNonBlank(user.verifiedEmailOptional().orElse(null), "mpesa-customer@payment-service.local"));
         payment.setAmountMinor(request.amountMinor());
         payment.setCurrency("KES");
+        payment.setSourceAmountMinor(request.amountMinor());
+        payment.setSourceCurrency("KES");
         payment.setProvider(MPESA);
         payment.setProviderReference(reference);
         payment.setIdempotencyKey(normalizedIdempotencyKey);
@@ -295,6 +320,22 @@ public class PaymentService {
     }
 
     @Transactional
+    public void verifyPaystackCallback(String reference) {
+        if (reference == null || reference.isBlank()) {
+            return;
+        }
+        Payment payment = paymentRepository.findWithLockingByProviderReference(reference).orElse(null);
+        if (payment == null || !PAYSTACK.equals(payment.getProvider())
+                || payment.getStatus() != PaymentStatus.PENDING) {
+            return;
+        }
+
+        PaystackVerification verification = paystackClient.verify(payment.getProviderReference());
+        recordProviderTransaction(payment, verification);
+        applyVerifiedStatus(payment, verification);
+    }
+
+    @Transactional
     public PaymentResponse createSandboxPayment(SandboxPaymentRequest request, String actor) {
         String currency = request.currency().trim().toUpperCase(Locale.ROOT);
         String provider = firstNonBlank(request.provider(), "SANDBOX").trim().toUpperCase(Locale.ROOT);
@@ -307,6 +348,8 @@ public class PaymentService {
         payment.setPaystackCustomerEmail(firstNonBlank(request.customerEmail(), "sandbox@payment-service.local"));
         payment.setAmountMinor(request.amountMinor());
         payment.setCurrency(currency);
+        payment.setSourceAmountMinor(request.amountMinor());
+        payment.setSourceCurrency(currency);
         payment.setProvider(provider);
         payment.setProviderReference(reference);
         payment.setAccessCode("sandbox");
@@ -396,6 +439,68 @@ public class PaymentService {
                 || !payment.getConversationId().equals(request.conversationId())) {
             throw new AccessDeniedException("Payment does not belong to the supplied booking context");
         }
+    }
+
+    private ChargeAmount resolveChargeAmount(
+            FlightAgentPaymentHandoff handoff,
+            FxQuoteRequest submittedQuote
+    ) {
+        String sourceCurrency = handoff.currency().trim().toUpperCase(Locale.ROOT);
+        if ("KES".equals(sourceCurrency)) {
+            return new ChargeAmount(
+                    handoff.amountMinor(),
+                    "KES",
+                    handoff.amountMinor(),
+                    "KES",
+                    null,
+                    null,
+                    null
+            );
+        }
+        if (!"USD".equals(sourceCurrency)) {
+            throw new IllegalArgumentException("Paystack conversion supports only USD or KES booking handoffs");
+        }
+        if (submittedQuote != null
+            && (!"frankfurter".equalsIgnoreCase(submittedQuote.provider())
+                || !"USD".equals(submittedQuote.baseCurrency())
+                || !"KES".equals(submittedQuote.quoteCurrency())
+            || submittedQuote.sourceAmountMinor() != handoff.amountMinor())) {
+            throw new AccessDeniedException("The supplied FX quote does not match the booking handoff");
+        }
+
+        FxRateQuote trusted = fxRateClient.latest("USD", "KES");
+        if (submittedQuote != null
+            && (!trusted.date().equals(submittedQuote.rateDate())
+            || trusted.rate().compareTo(submittedQuote.rate()) != 0)) {
+            throw new AccessDeniedException("The supplied FX quote is not the current trusted USD/KES quote");
+        }
+        long convertedAmountMinor = BigDecimal.valueOf(handoff.amountMinor())
+                .multiply(trusted.rate())
+                .setScale(0, RoundingMode.HALF_UP)
+                .longValueExact();
+        if (submittedQuote != null && convertedAmountMinor != submittedQuote.convertedAmountMinor()) {
+            throw new AccessDeniedException("The converted KES amount does not match the trusted FX quote");
+        }
+        return new ChargeAmount(
+                convertedAmountMinor,
+                "KES",
+                handoff.amountMinor(),
+                "USD",
+                trusted.rate(),
+                trusted.date(),
+                trusted.provider()
+        );
+    }
+
+    private record ChargeAmount(
+            long amountMinor,
+            String currency,
+            long sourceAmountMinor,
+            String sourceCurrency,
+            BigDecimal fxRate,
+            LocalDate fxRateDate,
+            String fxProvider
+    ) {
     }
 
     private void recordProviderTransaction(Payment payment, PaystackVerification verification) {

@@ -16,12 +16,15 @@ import Ngaritech.com.payment_service.payment.PaymentRepository;
 import Ngaritech.com.payment_service.payment.PaymentStatus;
 import Ngaritech.com.payment_service.payment.FlightAgentHandoffClient;
 import Ngaritech.com.payment_service.payment.FlightAgentPaymentHandoff;
+import Ngaritech.com.payment_service.fx.FxRateClient;
+import Ngaritech.com.payment_service.fx.FxRateQuote;
 import Ngaritech.com.payment_service.outbox.PaymentOutboxEventRepository;
 import Ngaritech.com.payment_service.webhook.PaymentWebhookEventRepository;
 import Ngaritech.com.payment_service.provider.ProviderTransactionRepository;
 import Ngaritech.com.payment_service.refund.RefundRepository;
 import Ngaritech.com.payment_service.paystack.PaystackClient;
 import Ngaritech.com.payment_service.paystack.PaystackInitialization;
+import Ngaritech.com.payment_service.paystack.PaystackInitializeRequest;
 import Ngaritech.com.payment_service.paystack.PaystackVerification;
 import com.nimbusds.jose.jwk.JWKSet;
 import com.nimbusds.jose.jwk.RSAKey;
@@ -61,13 +64,16 @@ import javax.crypto.spec.SecretKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.math.BigDecimal;
 import java.security.interfaces.RSAPrivateKey;
 import java.security.interfaces.RSAPublicKey;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -274,6 +280,25 @@ class PaymentServiceApplicationTests {
     }
 
     @Test
+    void usdBookingIsConvertedToKesByThePaymentServiceWhenNoFxQuoteIsSubmitted() throws Exception {
+        UUID userId = UUID.randomUUID();
+        UUID bookingId = UUID.randomUUID();
+
+        JsonNode response = createPayment(userId, bookingId, "usd-" + bookingId, "");
+        JsonNode payment = response.path("data");
+        PaystackInitializeRequest paystackRequest = TestBeans.LAST_PAYSTACK_REQUEST.get();
+
+        assertEquals(32_562_500L, payment.path("amountMinor").asLong());
+        assertEquals("KES", payment.path("currency").asText());
+        assertEquals(250_000L, payment.path("sourceAmountMinor").asLong());
+        assertEquals("USD", payment.path("sourceCurrency").asText());
+        assertEquals("130.25", payment.path("fxRate").asText());
+        assertEquals("2026-11-12", payment.path("fxRateDate").asText());
+        assertEquals("32562500", paystackRequest.amount());
+        assertEquals("KES", paystackRequest.currency());
+    }
+
+    @Test
     void requestBodyCannotAssignUserIdOrRoles() throws Exception {
         UUID authenticatedUserId = UUID.randomUUID();
         UUID attackerUserId = UUID.randomUUID();
@@ -343,15 +368,18 @@ class PaymentServiceApplicationTests {
     }
 
     @Test
-    void callbackIsPublicButDoesNotConfirmPayment() throws Exception {
+        void paystackBrowserCallbackVerifiesPaymentAndQueuesWaitNotification() throws Exception {
         JsonNode created = createPayment(UUID.randomUUID(), UUID.randomUUID(), "");
         UUID paymentId = UUID.fromString(created.path("data").path("id").asText());
+        String reference = created.path("data").path("providerReference").asText();
 
-        mockMvc.perform(get("/api/v1/payments/paystack/callback"))
+        mockMvc.perform(get("/api/v1/payments/paystack/callback").param("reference", reference))
                 .andExpect(status().isOk())
-                .andExpect(content().string(org.hamcrest.Matchers.containsString("secure provider notification")));
+            .andExpect(content().string(org.hamcrest.Matchers.containsString("Paystack confirms your payment")));
 
-        assertEquals(PaymentStatus.PENDING, paymentRepository.findById(paymentId).orElseThrow().getStatus());
+        assertEquals(PaymentStatus.SUCCESS, paymentRepository.findById(paymentId).orElseThrow().getStatus());
+        assertTrue(outboxEventRepository.findAll().stream()
+            .anyMatch(event -> "payment.succeeded".equals(event.getEventType())));
     }
 
     @Test
@@ -405,6 +433,15 @@ class PaymentServiceApplicationTests {
 
     private JsonNode createPayment(UUID userId, UUID bookingId, String extraFields) throws Exception {
         String conversationId = "conversation-" + bookingId;
+        return createPayment(userId, bookingId, conversationId, extraFields);
+        }
+
+        private JsonNode createPayment(
+            UUID userId,
+            UUID bookingId,
+            String conversationId,
+            String extraFields
+        ) throws Exception {
         String content = """
                 {"bookingId":"%s","conversationId":"%s","notificationUrl":"http://127.0.0.1:5678/webhook-waiting/%s?signature=test"%s}
                 """.formatted(bookingId, conversationId, bookingId, extraFields);
@@ -519,6 +556,8 @@ class PaymentServiceApplicationTests {
     @TestConfiguration
     static class TestBeans {
 
+        private static final AtomicReference<PaystackInitializeRequest> LAST_PAYSTACK_REQUEST = new AtomicReference<>();
+
         @Bean
         @Primary
         JwtDecoder jwtDecoder() {
@@ -543,6 +582,7 @@ class PaymentServiceApplicationTests {
             return new PaystackClient() {
                 @Override
                 public PaystackInitialization initialize(Ngaritech.com.payment_service.paystack.PaystackInitializeRequest request) {
+                    LAST_PAYSTACK_REQUEST.set(request);
                     return new PaystackInitialization(
                             "https://checkout.paystack.test/" + request.reference(),
                             "access_" + request.reference(),
@@ -568,15 +608,30 @@ class PaymentServiceApplicationTests {
         @Bean
         @Primary
         FlightAgentHandoffClient flightAgentHandoffClient() {
-            return (principalUserId, conversationId, bookingId) -> new FlightAgentPaymentHandoff(
-                    conversationId,
-                    principalUserId,
-                    bookingId,
-                    "INSTANT",
-                    "2500.00",
-                    250000,
-                    "KES",
-                    "off_test"
+            return (principalUserId, conversationId, bookingId) -> {
+                String currency = conversationId.startsWith("usd-") ? "USD" : "KES";
+                return new FlightAgentPaymentHandoff(
+                        conversationId,
+                        principalUserId,
+                        bookingId,
+                        "INSTANT",
+                        "2500.00",
+                        250000,
+                        currency,
+                        "off_test"
+                );
+            };
+        }
+
+        @Bean
+        @Primary
+        FxRateClient fxRateClient() {
+            return (baseCurrency, quoteCurrency) -> new FxRateQuote(
+                    "frankfurter",
+                    LocalDate.of(2026, 11, 12),
+                    baseCurrency,
+                    quoteCurrency,
+                    new BigDecimal("130.25")
             );
         }
 

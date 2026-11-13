@@ -23,6 +23,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.UUID;
@@ -103,14 +104,17 @@ public class PaymentController {
     }
 
     @GetMapping(value = "/payments/paystack/callback", produces = MediaType.TEXT_HTML_VALUE)
-    public ResponseEntity<String> paystackCallback() {
+        public ResponseEntity<String> paystackCallback(
+                        @RequestParam(name = "reference", required = false) String reference
+        ) {
+                paymentService.verifyPaystackCallback(reference);
         return ResponseEntity.ok("""
                 <!doctype html>
                 <html lang="en">
                 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Payment received</title></head>
                 <body style="font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;color:#102a43">
                 <h1>Payment callback received</h1>
-                <p>You can now return to WhatsApp. We will confirm payment after the secure provider notification is processed.</p>
+                <p>You can now return to WhatsApp. SafariGo will continue once Paystack confirms your payment.</p>
                 </body>
                 </html>
                 """);

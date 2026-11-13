@@ -11,6 +11,8 @@ import jakarta.persistence.Table;
 import jakarta.persistence.Version;
 
 import java.time.Instant;
+import java.time.LocalDate;
+import java.math.BigDecimal;
 import java.util.UUID;
 
 @Entity
@@ -37,6 +39,20 @@ public class Payment {
 
     @Column(nullable = false, length = 3)
     private String currency;
+
+    @Column(nullable = false)
+    private long sourceAmountMinor;
+
+    @Column(nullable = false, length = 3)
+    private String sourceCurrency;
+
+    @Column(precision = 19, scale = 8)
+    private BigDecimal fxRate;
+
+    private LocalDate fxRateDate;
+
+    @Column(length = 50)
+    private String fxProvider;
 
     @Column(nullable = false, length = 40)
     private String provider;
@@ -148,6 +164,46 @@ public class Payment {
 
     public void setCurrency(String currency) {
         this.currency = currency;
+    }
+
+    public long getSourceAmountMinor() {
+        return sourceAmountMinor;
+    }
+
+    public void setSourceAmountMinor(long sourceAmountMinor) {
+        this.sourceAmountMinor = sourceAmountMinor;
+    }
+
+    public String getSourceCurrency() {
+        return sourceCurrency;
+    }
+
+    public void setSourceCurrency(String sourceCurrency) {
+        this.sourceCurrency = sourceCurrency;
+    }
+
+    public BigDecimal getFxRate() {
+        return fxRate;
+    }
+
+    public void setFxRate(BigDecimal fxRate) {
+        this.fxRate = fxRate;
+    }
+
+    public LocalDate getFxRateDate() {
+        return fxRateDate;
+    }
+
+    public void setFxRateDate(LocalDate fxRateDate) {
+        this.fxRateDate = fxRateDate;
+    }
+
+    public String getFxProvider() {
+        return fxProvider;
+    }
+
+    public void setFxProvider(String fxProvider) {
+        this.fxProvider = fxProvider;
     }
 
     public String getProvider() {
